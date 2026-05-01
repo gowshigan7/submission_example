@@ -61,12 +61,17 @@ class StepGraph:
         WHITE, GRAY, BLACK = 0, 1, 2
         color = [WHITE] * len(self._nodes)
         path: list[int] = []
+        cycle: list[int] = []
 
         def dfs(u: int) -> bool:
+            nonlocal cycle
             color[u] = GRAY
             path.append(u)
             for v in self._nodes[u].dependents:
                 if color[v] == GRAY:
+                    # v is already in path — extract the cycle inline (fix C-8).
+                    idx = path.index(v)
+                    cycle = path[idx:] + [v]
                     return True
                 if color[v] == WHITE and dfs(v):
                     return True
@@ -77,12 +82,7 @@ class StepGraph:
         for i in range(len(self._nodes)):
             if color[i] == WHITE:
                 if dfs(i):
-                    last = path[-1]
-                    for v in self._nodes[last].dependents:
-                        if v in path:
-                            idx = path.index(v)
-                            return path[idx:] + [v]
-                    return path
+                    return cycle
         return []
 
     def parallel_groups(self) -> list[list[StepNode]]:

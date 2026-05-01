@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,6 +12,12 @@ import yaml
 
 if TYPE_CHECKING:
     from .config import Settings
+
+
+# Shell command-chaining operators that can bypass allow-list pattern matching.
+# fnmatch '*' matches '&&' and '||', so a pattern like 'curl *' would allow
+# 'curl http://x.com && rm -rf /' without this secondary check.
+_SHELL_CHAINING = re.compile(r'&&|\|\|')
 
 
 class ToolCallBlocked(Exception):
@@ -88,6 +95,15 @@ class SecurityHooks:
             raise ToolCallBlocked(command=command, reason="matches blocklist pattern", role=role)
         if not self._is_allowed_bash(command, role):
             raise ToolCallBlocked(command=command, reason="no matching allowlist pattern", role=role)
+        # Secondary check: fnmatch '*' matches '&&' and '||', so a command like
+        # 'curl http://x.com && rm -rf /' can pass the allow-list pattern 'curl *'.
+        # Block chaining operators explicitly (fix S-2).
+        if _SHELL_CHAINING.search(command):
+            raise ToolCallBlocked(
+                command=command,
+                reason="shell chaining operators (&& or ||) not permitted; split into separate commands",
+                role=role,
+            )
 
     def pre_tool_guard(self, tool_name: str, role: str | None = None) -> None:
         allowed = set(self._policy.default_sdk_tools)

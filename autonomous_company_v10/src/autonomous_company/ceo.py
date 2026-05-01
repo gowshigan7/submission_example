@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -165,7 +166,14 @@ class CEO:
 
     def _sanitize_mission(self, text: str) -> str:
         """Escape Jinja2 control syntax in user-provided mission text."""
-        return text.replace("{{", "{ {").replace("}}", "} }").replace("{%", "{ %").replace("%}", "% }")
+        return (text
+                .replace("{{{", "{ { {")  # must escape triple first
+                .replace("{{", "{ {")
+                .replace("}}", "} }")
+                .replace("{%", "{ %")
+                .replace("%}", "% }")
+                .replace("{#", "{ #")
+                .replace("#}", "# }"))
 
     def _render_ceo_prompt(
         self,
@@ -190,7 +198,7 @@ class CEO:
     def _minimal_fallback_prompt(self, *, budget_usd: float, max_roles: int) -> str:
         return (
             f"You are the CEO of an autonomous company. Your mission is:\n\n"
-            f"{self._company.mission}\n\n"
+            f"{self._sanitize_mission(self._company.mission)}\n\n"
             f"Workspace: {self._workspace}\n"
             f"Budget: ${budget_usd:.2f}\n"
             f"Max roles: {max_roles}\n\n"
@@ -221,7 +229,7 @@ class CEO:
         2. Build user prompt (mission + optional clarifications)
         3. Call ask() with output_schema=TeamPlan.model_json_schema()
         4. Parse as TeamPlan (validates DAG automatically)
-        5. HITL loop if plan.ask_human is set (max MAX_PLAN_HITL_CHAIN rounds)
+        5. HITL loop if plan.ask_human is set (max max_plan_hitl_chain rounds)
         6. Emit plan.created event
         """
         tracer = get_tracer()
@@ -244,6 +252,9 @@ class CEO:
 
             plan: TeamPlan | None = None
             hitl_rounds = 0
+            max_hitl_rounds = (
+                self._settings.max_plan_hitl_chain if self._settings else MAX_PLAN_HITL_CHAIN
+            )
 
             while True:
                 log.info("ceo.planning", company_id=self._company.id, hitl_round=hitl_rounds)
@@ -275,7 +286,7 @@ class CEO:
                     log.error("ceo.plan_parse_failed", error=str(exc), raw=str(raw)[:500])
                     raise ValueError(f"CEO produced invalid TeamPlan: {exc}") from exc
 
-                if plan.ask_human and hitl_rounds < MAX_PLAN_HITL_CHAIN:
+                if plan.ask_human and hitl_rounds < max_hitl_rounds:
                     log.info("ceo.plan_hitl", prompt=plan.ask_human[:100])
                     human_response = await self._ask_human(plan.ask_human)
                     user_prompt += f"\n\nHuman response: {human_response}"
@@ -321,10 +332,35 @@ class CEO:
                 if cp.status == StepStatus.COMPLETED and cp.output:
                     self._step_outputs[cp.step_index] = cp.output
 
+            # Re-hydrate total_spent from persisted checkpoints so budget
+            # enforcement is correct when resuming after a crash (fix C-2).
+            self._total_spent = sum(
+                cp.cost_usd for cp in checkpoints
+                if cp.status == StepStatus.COMPLETED
+            )
+
             if self._completed_steps:
                 log.info("ceo.orchestrate_resuming",
                          completed=len(self._completed_steps),
                          company_id=self._company.id)
+                # Reset any RUNNING steps to PENDING so they re-execute
+                # cleanly on resume instead of being skipped or double-run (fix C-4).
+                await self._storage.reset_running_checkpoints(self._company.id)
+
+            # Detect plan changes between runs so the caller knows that
+            # resuming from stale checkpoints may produce wrong outputs (fix H-15).
+            plan_hash = hashlib.sha256(plan.model_dump_json().encode()).hexdigest()
+            stored_hash = await self._storage.get_plan_hash(self._company.id)
+            if stored_hash is None:
+                await self._storage.set_plan_hash(self._company.id, plan_hash)
+            elif stored_hash != plan_hash:
+                log.warning(
+                    "ceo.plan_hash_mismatch",
+                    company_id=self._company.id,
+                    stored=stored_hash[:16],
+                    current=plan_hash[:16],
+                    advice="Delete checkpoints to start fresh if outputs look wrong.",
+                )
 
             graph = StepGraph(plan.steps)
 
@@ -332,7 +368,7 @@ class CEO:
             for role_spec in plan.roles:
                 worker = self._create_worker(role_spec)
                 workers[role_spec.role_name] = worker
-                await self._storage.save_agent(worker._agent)
+                await self._storage.save_agent(worker.agent)
 
             await self._emit("orchestration.started", {
                 "company_id": self._company.id,
@@ -471,7 +507,7 @@ class CEO:
             inbox = await read_inbox(
                 self._storage,
                 company_id=self._company.id,
-                agent_id=worker._agent.id,
+                agent_id=worker.agent.id,
             )
 
             peer_roles = [r for r in workers.keys() if r != step.to_role]
@@ -496,14 +532,14 @@ class CEO:
                     if worker_reply.outbound:
                         await self._dispatch_outbound(
                             worker_reply.outbound, workers,
-                            from_agent_id=worker._agent.id,
+                            from_agent_id=worker.agent.id,
                             company_id=self._company.id,
                         )
                     if worker_reply.escalate_to_ceo:
                         await send_message(
                             self._storage,
                             company_id=self._company.id,
-                            from_agent_id=worker._agent.id,
+                            from_agent_id=worker.agent.id,
                             to_agent_id=self._agent.id,
                             content=worker_reply.escalate_to_ceo,
                             kind=MessageKind.ESCALATION,
@@ -530,7 +566,7 @@ class CEO:
                         self._storage,
                         company_id=company_id,
                         from_agent_id=from_agent_id,
-                        to_agent_id=worker._agent.id,
+                        to_agent_id=worker.agent.id,
                         content=msg.content,
                         kind=msg.kind,
                         severity=msg.severity,
@@ -542,7 +578,7 @@ class CEO:
                 if not target:
                     log.warning("ceo.outbound_unknown_target", target=msg.to)
                     continue
-                to_id = target._agent.id
+                to_id = target.agent.id
 
             await send_message(
                 self._storage,
@@ -572,7 +608,7 @@ class CEO:
                 inbox = await read_inbox(
                     self._storage,
                     company_id=self._company.id,
-                    agent_id=worker._agent.id,
+                    agent_id=worker.agent.id,
                     mark_delivered=True,
                 )
 

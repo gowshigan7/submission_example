@@ -124,6 +124,13 @@ class Storage:
             except Exception:
                 await conn.rollback()
                 raise
+        # Add plan_hash column to existing databases that pre-date this migration.
+        # ALTER TABLE fails silently if the column already exists.
+        try:
+            await conn.execute("ALTER TABLE companies ADD COLUMN plan_hash TEXT")
+            await conn.commit()
+        except Exception:
+            pass
 
     async def save_company(self, company: Company) -> Company:
         conn = self._require_conn()
@@ -150,6 +157,19 @@ class Storage:
     async def update_company_spent(self, company_id: str, spent_usd: float) -> None:
         conn = self._require_conn()
         await conn.execute("UPDATE companies SET spent_usd = ?, updated_at = ? WHERE id = ?", (spent_usd, self._now(), company_id))
+        await conn.commit()
+
+    async def get_plan_hash(self, company_id: str) -> str | None:
+        conn = self._require_conn()
+        async with conn.execute("SELECT plan_hash FROM companies WHERE id = ?", (company_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return row["plan_hash"]
+
+    async def set_plan_hash(self, company_id: str, plan_hash: str) -> None:
+        conn = self._require_conn()
+        await conn.execute("UPDATE companies SET plan_hash = ? WHERE id = ?", (plan_hash, company_id))
         await conn.commit()
 
     async def save_agent(self, agent: Agent) -> Agent:
@@ -264,16 +284,76 @@ class Storage:
             rows = await cur.fetchall()
         return [StepCheckpoint(company_id=r["company_id"], step_index=r["step_index"], status=r["status"], output=r["output"], attempt=r["attempt"], error=r["error"], cost_usd=r["cost_usd"], started_at=r["started_at"], completed_at=r["completed_at"]) for r in rows]
 
-    async def update_checkpoint_status(self, company_id: str, step_index: int, status: str, output: str | None = None, error: str | None = None, cost_usd: float = 0.0) -> None:
+    async def update_checkpoint_status(
+        self,
+        company_id: str,
+        step_index: int,
+        status: str,
+        output: str | None = None,
+        error: str | None = None,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """UPSERT a checkpoint row. Safe to call before save_checkpoint (fix C-3)."""
         conn = self._require_conn()
         now = self._now()
         terminal = {StepStatus.COMPLETED.value, StepStatus.FAILED.value, StepStatus.SKIPPED.value}
+
         if status == StepStatus.RUNNING.value:
-            await conn.execute("UPDATE step_checkpoints SET status = ?, output = ?, error = ?, cost_usd = ?, started_at = COALESCE(started_at, ?) WHERE company_id = ? AND step_index = ?", (status, output, error, cost_usd, now, company_id, step_index))
+            # On insert: record started_at and set attempt=1.
+            # On conflict: preserve existing started_at, increment attempt.
+            await conn.execute(
+                """
+                INSERT INTO step_checkpoints
+                    (company_id, step_index, status, output, attempt, error, cost_usd, started_at, completed_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL)
+                ON CONFLICT(company_id, step_index) DO UPDATE SET
+                    status = excluded.status,
+                    output = excluded.output,
+                    error = excluded.error,
+                    cost_usd = excluded.cost_usd,
+                    started_at = COALESCE(step_checkpoints.started_at, excluded.started_at),
+                    attempt = step_checkpoints.attempt + 1
+                """,
+                (company_id, step_index, status, output, error, cost_usd, now),
+            )
         elif status in terminal:
-            await conn.execute("UPDATE step_checkpoints SET status = ?, output = ?, error = ?, cost_usd = ?, completed_at = ? WHERE company_id = ? AND step_index = ?", (status, output, error, cost_usd, now, company_id, step_index))
+            await conn.execute(
+                """
+                INSERT INTO step_checkpoints
+                    (company_id, step_index, status, output, attempt, error, cost_usd, started_at, completed_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, NULL, ?)
+                ON CONFLICT(company_id, step_index) DO UPDATE SET
+                    status = excluded.status,
+                    output = excluded.output,
+                    error = excluded.error,
+                    cost_usd = excluded.cost_usd,
+                    completed_at = excluded.completed_at
+                """,
+                (company_id, step_index, status, output, error, cost_usd, now),
+            )
         else:
-            await conn.execute("UPDATE step_checkpoints SET status = ?, output = ?, error = ?, cost_usd = ? WHERE company_id = ? AND step_index = ?", (status, output, error, cost_usd, company_id, step_index))
+            await conn.execute(
+                """
+                INSERT INTO step_checkpoints
+                    (company_id, step_index, status, output, attempt, error, cost_usd, started_at, completed_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, NULL, NULL)
+                ON CONFLICT(company_id, step_index) DO UPDATE SET
+                    status = excluded.status,
+                    output = excluded.output,
+                    error = excluded.error,
+                    cost_usd = excluded.cost_usd
+                """,
+                (company_id, step_index, status, output, error, cost_usd),
+            )
+        await conn.commit()
+
+    async def reset_running_checkpoints(self, company_id: str) -> None:
+        """Reset RUNNING steps to PENDING so they re-execute cleanly on resume (fix C-4)."""
+        conn = self._require_conn()
+        await conn.execute(
+            "UPDATE step_checkpoints SET status = 'pending' WHERE company_id = ? AND status = 'running'",
+            (company_id,),
+        )
         await conn.commit()
 
     async def delete_checkpoints(self, company_id: str) -> None:
@@ -313,10 +393,16 @@ class Storage:
     def _row_to_hitl(row: aiosqlite.Row) -> HITLRequest:
         return HITLRequest(id=row["id"], company_id=row["company_id"], agent_id=row["agent_id"], prompt=row["prompt"], status=row["status"], response=row["response"], created_at=row["created_at"], resolved_at=row["resolved_at"])
 
-    async def save_event(self, event: Event) -> None:
+    async def save_event(self, event: Event) -> str:
+        """Persist an event and return its DB-assigned id (fix C-5)."""
         conn = self._require_conn()
-        await conn.execute("INSERT INTO events (company_id, type, payload, created_at) VALUES (?, ?, ?, ?)", (event.company_id, event.type, json.dumps(event.payload), self._dt_to_iso(event.created_at)))
+        cur = await conn.execute(
+            "INSERT INTO events (company_id, type, payload, created_at) VALUES (?, ?, ?, ?)",
+            (event.company_id, event.type, json.dumps(event.payload), self._dt_to_iso(event.created_at)),
+        )
+        rowid = cur.lastrowid
         await conn.commit()
+        return str(rowid) if rowid is not None else event.id
 
     async def get_events(self, company_id: str, since: datetime | None = None) -> list[Event]:
         conn = self._require_conn()

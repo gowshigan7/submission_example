@@ -35,7 +35,10 @@ class EventBus:
             try:
                 from .models import Event as EventModel
                 db_event = EventModel(id=event.id, company_id=event.company_id, type=event.type, payload=event.payload, created_at=event.created_at)
-                await self._storage.save_event(db_event)
+                db_id = await self._storage.save_event(db_event)
+                # Update event.id to the DB-assigned integer id so that live
+                # stream events and replayed events share the same id (fix C-5).
+                event.id = db_id
             except Exception as exc:
                 log.warning("events.persist_failed", error=str(exc))
         async with self._lock:
