@@ -1,0 +1,151 @@
+# autonomous_company_v10 — tools allow-list
+# Patterns use fnmatch glob syntax (* matches anything).
+
+default:
+  sdk_tools:
+    - "Read"
+    - "Write"
+    - "Edit"
+    - "Glob"
+    - "Grep"
+    - "LS"
+    - "WebSearch"
+    - "WebFetch"
+    - "TodoWrite"
+    - "Task"
+    - "NotebookRead"
+    - "NotebookEdit"
+
+  bash_patterns:
+    - "grep *"
+    - "grep -* *"
+    - "find * -name *"
+    - "find * -type *"
+    - "cat *"
+    - "head *"
+    - "tail *"
+    - "ls"
+    - "ls *"
+    - "ls -* *"
+    - "echo *"
+    - "wc *"
+    - "diff *"
+    - "pwd"
+    - "date"
+    - "which *"
+    - "python --version"
+    - "python -m *"
+    - "pytest *"
+    - "pytest"
+    - "uv run *"
+    - "uv pip list"
+    - "git status"
+    - "git log *"
+    - "git diff *"
+    - "git show *"
+    - "git branch"
+    - "curl -s *"
+    - "curl --silent *"
+    - "npm test"
+    - "npm run *"
+
+role_overrides:
+  backend_engineer:
+    sdk_tools:
+      - "Bash"
+    bash_patterns:
+      - "git add *"
+      - "git commit -m *"
+      - "git checkout *"
+      - "uv add *"
+      - "uv sync"
+      - "pip install *"
+      - "make *"
+      - "cp *"
+      - "mv *"
+      - "mkdir -p *"
+      - "touch *"
+      - "rm -f *"
+
+  frontend_engineer:
+    sdk_tools:
+      - "Bash"
+    bash_patterns:
+      - "npm install"
+      - "npm install *"
+      - "npm ci"
+      - "npm run build"
+      - "npm run dev"
+      - "yarn install"
+      - "yarn *"
+      - "git add *"
+      - "git commit -m *"
+      - "cp *"
+      - "mkdir -p *"
+      - "rm -f *"
+
+  data_scientist:
+    sdk_tools:
+      - "Bash"
+      - "NotebookRead"
+      - "NotebookEdit"
+    bash_patterns:
+      - "python *"
+      - "pip install *"
+      - "uv add *"
+      - "cp *"
+      - "mkdir -p *"
+
+  devops_engineer:
+    sdk_tools:
+      - "Bash"
+    bash_patterns:
+      - "docker build *"
+      - "docker run --rm *"
+      - "docker images"
+      - "docker ps"
+      - "kubectl get *"
+      - "kubectl describe *"
+      - "kubectl apply -f *"
+      - "terraform plan *"
+      - "terraform validate"
+      - "cp *"
+      - "mkdir -p *"
+      - "git add *"
+      - "git commit -m *"
+
+  researcher:
+    sdk_tools:
+      - "WebSearch"
+      - "WebFetch"
+      - "Read"
+      - "Glob"
+      - "Grep"
+    bash_patterns:
+      - "curl -s *"
+      - "curl --silent *"
+
+blocklist:
+  bash_patterns:
+    - "rm -rf *"
+    - "rm -rf"
+    - "rm --recursive *"
+    - "* | bash"
+    - "* | sh"
+    - "bash -c *"
+    - "sh -c *"
+    - "eval *"
+    - "exec *"
+    - "sudo *"
+    - "su *"
+    - "chmod 777 *"
+    - "chown *"
+    - "dd if=*"
+    - "mkfs*"
+    - "mount *"
+    - "iptables *"
+    - "docker run --privileged *"
+    - "kubectl exec *"
+    - "systemctl *"
+    - "crontab *"
+    - "nohup *"
